@@ -81,3 +81,63 @@ def request(url, max_redirect=10):
         return request(headers["location"], max_redirect - 1)
 
     return status_line, headers, body
+
+
+class TextExtractor(HTMLParser):
+    """Collects visible text, skipping <script> and <style> blocks."""
+
+    def __init__(self):
+        super().__init__()
+        self._skip = 0      # counter, not bool — handles nesting correctly
+        self._parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+
+    def handle_data(self, data):
+        if self._skip == 0:
+            self._parts.append(data)
+
+    def get_text(self):
+        lines = []
+        for part in self._parts:
+            for line in part.splitlines():
+                if line.strip():
+                    lines.append(line)
+        return "\n".join(lines)
+
+
+def show(body_bytes, headers):
+    """Decode body and print plain text, stripping HTML tags."""
+    content_type = headers.get("content-type", "")
+
+    # Encoding resolution
+    encoding = "utf-8"
+    if "charset=" in content_type:
+        encoding = content_type.split("charset=", 1)[1].split(";")[0].strip()
+
+    # Decode with fallback chain (deduplicated so declared encoding isn't tried twice)
+    candidates = [encoding] + [e for e in ["utf-8", "euc-kr", "latin-1"] if e != encoding]
+    text = None
+    for enc in candidates:
+        try:
+            text = body_bytes.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    if text is None:
+        raise ValueError("Unable to decode body with any supported encoding")
+
+    if "html" not in content_type:
+        print(text)
+        return
+
+    extractor = TextExtractor()
+    extractor.feed(text)
+    print(extractor.get_text())

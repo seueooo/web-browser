@@ -105,3 +105,46 @@ def test_redirect_limit_raises():
         from browser import request
         with pytest.raises(RuntimeError, match="Too many redirects"):
             request("http://example.com/old", max_redirect=0)
+
+
+import io
+from contextlib import redirect_stdout
+
+def _capture_show(body_bytes, headers):
+    from browser import show
+    f = io.StringIO()
+    with redirect_stdout(f):
+        show(body_bytes, headers)
+    return f.getvalue()
+
+def test_show_extracts_text():
+    html = b"<html><body><p>Hello World</p></body></html>"
+    out = _capture_show(html, {"content-type": "text/html"})
+    assert "Hello World" in out
+
+def test_show_skips_script():
+    html = b"<html><body><script>alert(1)</script><p>Visible</p></body></html>"
+    out = _capture_show(html, {"content-type": "text/html"})
+    assert "alert" not in out
+    assert "Visible" in out
+
+def test_show_skips_style():
+    html = b"<html><head><style>body{color:red}</style></head><body>Text</body></html>"
+    out = _capture_show(html, {"content-type": "text/html"})
+    assert "color" not in out
+    assert "Text" in out
+
+def test_show_handles_utf8_encoding():
+    html = "안녕하세요".encode("utf-8")
+    out = _capture_show(html, {"content-type": "text/html; charset=utf-8"})
+    assert "안녕하세요" in out
+
+def test_show_handles_euckr_fallback():
+    html = b"<p>" + "안녕".encode("euc-kr") + b"</p>"
+    out = _capture_show(html, {"content-type": "text/html"})
+    assert "안녕" in out
+
+def test_show_non_html_prints_raw():
+    body = b"{'key': 'value'}"
+    out = _capture_show(body, {"content-type": "application/json"})
+    assert "key" in out
