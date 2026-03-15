@@ -153,8 +153,15 @@ def request(url, max_redirect=10):
         if not is_redirect:
             _socket_pool[pool_key] = (s, excess)  # return socket to pool
     else:
+        # No Content-Length: read until server closes connection.
+        # HTTP/1.1 keep-alive servers won't send EOF, so treat a timeout
+        # as end-of-body and close the socket.
+        s.settimeout(3)
         while True:
-            chunk = s.recv(4096)
+            try:
+                chunk = s.recv(4096)
+            except (TimeoutError, OSError):
+                break  # server kept connection alive — treat as EOF
             if not chunk:
                 break
             body += chunk

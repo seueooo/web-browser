@@ -4,117 +4,173 @@ Date: 2026-03-15
 
 ## Overview
 
-A command-line Python web browser that fetches a URL using raw sockets, parses the HTTP response, and displays the plain text content of the page. No external packages required. Supports HTTPS and Korean-language sites.
+A command-line Python web browser that fetches a URL using raw sockets, parses the HTTP response, and displays the plain text content of the page. No external packages required. Built for learning purposes.
 
 ## Usage
 
 ```bash
-python browser.py https://example.com
+python3 browser.py <url>      # fetch a URL
+python3 browser.py            # opens DEFAULT_URL (file:///etc/hosts)
 ```
+
+Supported URL schemes: `http`, `https`, `file`, `data`, `view-source`
 
 ## Architecture
 
-Single file: `browser.py`, four functions with one clear responsibility each.
+Single file: `browser.py`
 
 ```
-parse_url(url)          → (scheme, host, port, path)
-request(url)            → (status_line, headers_dict, body_bytes)
-show(body_bytes, headers_dict) → prints plain text to stdout
-main()                  → reads sys.argv[1], orchestrates the above
+parse_url(url)                      → (scheme, host, port, path)
+_decode_chunked(data)               → bytes
+request(url, max_redirect=10)       → (status_line, headers_dict, body_bytes)
+TextExtractor(HTMLParser)           → visible text collector
+show(body_bytes, headers_dict)      → prints plain text to stdout
+main()                              → reads sys.argv[1], orchestrates the above
 ```
+
+Module-level state:
+- `_socket_pool` — keep-alive socket cache keyed by `(scheme, host, port)`
+- `_cache` — HTTP response cache keyed by URL
+
+---
 
 ## Function Specifications
 
 ### `parse_url(url) → (scheme, host, port, path)`
 
-- Splits URL on `://` to extract scheme (`http` or `https`)
+Handles special schemes before general parsing:
+
+| Input prefix | Returns |
+|---|---|
+| `file://` | `("file", "", 0, /absolute/path)` |
+| `data:` | `("data", "", 0, mime,content)` |
+| `view-source:` | `("view-source", "", 0, inner_url)` |
+
+For `http`/`https`:
+- Splits on `://` to extract scheme
 - Default ports: `http` → 80, `https` → 443
-- Strips fragment (`#...`) before further parsing
-- Separates host from path on first `/`; path defaults to `/` if absent
+- Strips fragment (`#...`)
+- Separates host from path on first `/`; path defaults to `/`
 - Path includes query string (`?...`) if present
-- Extracts explicit port from host if present (`host:8080`), converts to int
+- Extracts explicit port from host (`host:8080`), converts to int
+
+### `_decode_chunked(data: bytes) → bytes`
+
+Decodes HTTP chunked transfer-encoding:
+- Reads hex chunk size, then that many bytes of data
+- Repeats until chunk size is `0`
+- Returns concatenated raw body bytes
 
 ### `request(url, max_redirect=10) → (status_line, headers_dict, body_bytes)`
 
-- Calls `parse_url(url)` to get connection parameters
-- Creates a TCP socket via `socket.socket(AF_INET, SOCK_STREAM)`
-- Sets `socket.settimeout(10)` to avoid hanging on unresponsive servers
-- For HTTPS: wraps socket with `ssl.create_default_context().wrap_socket(s, server_hostname=host)`
-- Uses **HTTP/1.0** — server closes connection after response, so no chunked encoding or Content-Length parsing needed
-- Request format:
-  ```
-  GET {path} HTTP/1.0\r\n
-  Host: {host}\r\n
-  \r\n
-  ```
-- Reads full response in a loop (`recv(4096)`) until socket returns empty bytes
-- Splits raw bytes on first `b'\r\n\r\n'` into header section and body bytes
-- Parses status line (first line of header section)
-- Parses headers: `line.split(': ', 1)` (maxsplit=1 to handle colons in values like URLs or dates)
-- Header keys stored lowercased for case-insensitive lookup
-- On 3xx response: extracts `location` header, calls `request(location, max_redirect - 1)` recursively; raises `RuntimeError` if `max_redirect` reaches 0
+Dispatch order at entry:
+
+1. **`file://`** — opens local file, returns `("200 OK", {"content-type": "text/html"}, bytes)`
+2. **`data:`** — parses `mime,content`, returns body as UTF-8 bytes
+3. **`view-source:`** — fetches inner URL recursively, sets `headers["_view_source"] = True`
+4. **Cache lookup** — returns cached response if not expired
+5. **HTTP/HTTPS network request**
+
+Network request flow:
+- Reuses socket from `_socket_pool` if available (keep-alive), otherwise creates new
+- For HTTPS: wraps socket with `ssl.create_default_context().wrap_socket()`
+- Request headers sent: `Host`, `Connection: keep-alive`, `User-Agent: SimpleBrowser/1.0`, `Accept-Encoding: gzip`
+- Request line: `GET {path} HTTP/1.1`
+- Reads response headers until `\r\n\r\n`, starting from any buffered excess bytes
+
+Body reading:
+| Condition | Behavior |
+|---|---|
+| `Content-Length` present | Read exactly N bytes; store excess in socket pool |
+| `Transfer-Encoding: chunked` | Read until EOF, then decode with `_decode_chunked()` |
+| Neither (no Content-Length) | Read with 3s timeout; treat `TimeoutError` as EOF |
+
+Post-body processing (in order):
+1. Chunked decoding if `Transfer-Encoding: chunked`
+2. Gzip decompression if `Content-Encoding: gzip`
+3. Cache store if status `200` and `Cache-Control` allows it
+4. Redirect follow if status `3xx`
+
+**Keep-alive socket pool:**
+- Key: `(scheme, host, port)`
+- Value: `(socket, excess_bytes)` — excess bytes from the previous response are replayed as the start of the next response's header
+- Socket is NOT pooled when following a redirect
+
+**Caching:**
+- Only 200 responses are cached
+- `Cache-Control: no-store` → never cache
+- `Cache-Control: max-age=N` → cache for N seconds
+- Any other Cache-Control value → do not cache
+- Cache key is the full URL string
+
+**Redirects:**
+- Follows `Location` header on any 3xx response
+- `//`-relative → prepend scheme
+- `/`-relative → prepend `scheme://host[:port]`
+- Raises `RuntimeError("Too many redirects")` after 10 hops
+
+### `TextExtractor(HTMLParser)`
+
+Subclass of `html.parser.HTMLParser` that collects visible text:
+- Maintains `_skip` counter (int); increments on `<script>`/`<style>`, decrements on `</script>`/`</style>`
+- Appends data to `_parts` only when `_skip == 0`
+- `get_text()` calls `html.unescape()` on each part (decodes `&lt;`, `&gt;`, `&amp;`, etc.), then strips blank lines
 
 ### `show(body_bytes, headers_dict)`
 
-- Encoding resolution (in order):
-  1. Parse `charset=` value from `content-type` header using `str.split`
-  2. If not found, try UTF-8 decode
-  3. On `UnicodeDecodeError`, try EUC-KR
-  4. Final fallback: latin-1 (never raises)
-- Decodes body bytes to string
-- Skips `show()` if `content-type` does not contain `html` (prints raw text instead)
-- Uses `HTMLParser` subclass `TextExtractor`:
-  - Maintains a `_skip` counter (int, not bool) initialized to 0
-  - `handle_starttag`: increments `_skip` when tag is `script` or `style`
-  - `handle_endtag`: decrements `_skip` when tag is `script` or `style` (floor at 0)
-  - `handle_data`: appends data to list only when `_skip == 0`
-- Joins collected text chunks, strips lines that are blank or whitespace-only, prints result
+- If `headers["_view_source"]` is `True`: decode as UTF-8 and print raw HTML, return
+- Encoding resolution:
+  1. Parse `charset=` from `Content-Type` header
+  2. Try declared encoding, then `utf-8`, `euc-kr`, `latin-1` in order
+- If `content-type` does not contain `html`: print raw decoded text
+- Otherwise: feed through `TextExtractor`, print result
 
 ### `main()`
 
-- Reads `sys.argv[1]` as URL; prints `Usage: browser.py <url>` and exits with code 1 if missing
-- Calls `request(url)` and prints the full response structure in labeled sections:
-  1. `=== Request ===` — shows the request line and Host header that was sent
-  2. `=== Response Status ===` — shows the raw status line
-  3. `=== Response Headers ===` — shows all headers as `key: value` pairs
-  4. `=== Body (text) ===` — calls `show()` to print parsed plain text
-- Each section is separated by a blank line for readability
+- URL = `sys.argv[1]` if provided, else `DEFAULT_URL`
+- Prints four labeled sections separated by blank lines:
+  1. `=== Request ===` — URL
+  2. `=== Response Status ===` — raw status line
+  3. `=== Response Headers ===` — all headers except internal `_`-prefixed keys
+  4. `=== Body (text) ===` — output of `show()`
+
+---
 
 ## Output Format
 
 ```
 === Request ===
-GET / HTTP/1.0
-Host: example.com
+URL: https://example.com
 
 === Response Status ===
-HTTP/1.0 200 OK
+HTTP/1.1 200 OK
 
 === Response Headers ===
 content-type: text/html; charset=UTF-8
 content-length: 1256
-...
 
 === Body (text) ===
 Example Domain
 This domain is for use in illustrative examples...
 ```
 
-`main()` prints each section separated by a labeled divider (`=== ... ===`), so the full HTTP request/response structure is visible at a glance.
+---
 
 ## Error Handling
 
 | Condition | Behavior |
 |---|---|
-| Missing URL argument | Print usage, exit(1) |
-| Redirect loop > 10 | Raise RuntimeError |
-| Socket timeout | Exception propagates with message |
-| UnicodeDecodeError | Fallback encoding chain (UTF-8 → EUC-KR → latin-1) |
-| Non-HTML content-type | Print body as raw text |
+| No URL argument | Opens `DEFAULT_URL` |
+| Redirect loop > 10 | `RuntimeError: Too many redirects` |
+| Socket timeout (headers) | Exception propagates |
+| Socket timeout (body, no Content-Length) | Treat as EOF, return accumulated body |
+| `UnicodeDecodeError` | Fallback chain: declared → UTF-8 → EUC-KR → latin-1 |
+| Non-HTML content-type | Print raw decoded text |
+
+---
 
 ## Constraints
 
-- Standard library only: `socket`, `ssl`, `html.parser`, `sys`
+- Standard library only: `socket`, `ssl`, `gzip`, `time`, `html`, `html.parser`, `sys`
 - Python 3.6+
-- HTTP/1.0 only (no chunked transfer encoding, no persistent connections)
-- Handles 3xx redirects (301, 302, 303, 307, 308); all use `Location` header
+- HTTP/1.1 with keep-alive and gzip support
