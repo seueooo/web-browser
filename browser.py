@@ -78,7 +78,14 @@ def request(url, max_redirect=10):
     if status_code.startswith("3") and "location" in headers:
         if max_redirect == 0:
             raise RuntimeError("Too many redirects")
-        return request(headers["location"], max_redirect - 1)
+        location = headers["location"]
+        # Resolve relative redirects to absolute URLs
+        if location.startswith("//"):
+            location = scheme + ":" + location
+        elif location.startswith("/"):
+            port_part = f":{port}" if port not in (80, 443) else ""
+            location = f"{scheme}://{host}{port_part}{location}"
+        return request(location, max_redirect - 1)
 
     return status_line, headers, body
 
@@ -149,12 +156,10 @@ def main():
         sys.exit(1)
 
     url = sys.argv[1]
-    scheme, host, port, path = parse_url(url)
 
-    # Show what request will be sent
+    # Show what will be requested
     print("=== Request ===")
-    print(f"GET {path} HTTP/1.0")
-    print(f"Host: {host}")
+    print(f"URL: {url}")
     print()
 
     status_line, headers, body = request(url)
