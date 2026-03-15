@@ -141,3 +141,39 @@ def show(body_bytes, headers):
     extractor = TextExtractor()
     extractor.feed(text)
     print(extractor.get_text())
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: browser.py <url>")
+        sys.exit(1)
+
+    url = sys.argv[1]
+    scheme, host, port, path = parse_url(url)
+
+    # Show what request will be sent
+    print("=== Request ===")
+    print(f"GET {path} HTTP/1.0")
+    print(f"Host: {host}")
+    print()
+
+    status_line, headers, body = request(url)
+
+    # Show response status
+    print("=== Response Status ===")
+    print(status_line)
+    print()
+
+    # Show all response headers
+    print("=== Response Headers ===")
+    for key, value in headers.items():
+        print(f"{key}: {value}")
+    print()
+
+    # Show parsed body text
+    print("=== Body (text) ===")
+    show(body, headers)
+
+
+if __name__ == "__main__":
+    main()

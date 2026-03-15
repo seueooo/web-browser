@@ -148,3 +148,26 @@ def test_show_non_html_prints_raw():
     body = b"{'key': 'value'}"
     out = _capture_show(body, {"content-type": "application/json"})
     assert "key" in out
+
+import pytest
+
+def test_main_missing_arg_exits(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["browser.py"])
+    with pytest.raises(SystemExit):
+        from browser import main
+        main()
+
+def test_main_shows_section_headers(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["browser.py", "http://example.com"])
+    import browser
+    monkeypatch.setattr(browser, "request", lambda url, **kw: (
+        "HTTP/1.0 200 OK",
+        {"content-type": "text/html"},
+        b"<p>Hi</p>"
+    ))
+    browser.main()
+    out = capsys.readouterr().out
+    assert "=== Request ===" in out
+    assert "=== Response Status ===" in out
+    assert "=== Response Headers ===" in out
+    assert "=== Body (text) ===" in out
