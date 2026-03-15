@@ -50,7 +50,7 @@ def request(url, max_redirect=10):
 
         # Send HTTP/1.0 request
         req = f"GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n"
-        s.send(req.encode("utf-8"))
+        s.sendall(req.encode("utf-8"))
 
         # Read full response until EOF
         raw = b""
