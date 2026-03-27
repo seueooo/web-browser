@@ -1,4 +1,5 @@
 import tkinter
+from browser import HttpClient
 from layout import WIDTH, HEIGHT, HSTEP, VSTEP, SCROLL_STEP, lex, layout as do_layout
 
 
@@ -15,6 +16,7 @@ class Browser:
         )
         self.canvas.pack(fill="both", expand=True)
 
+        self._client = HttpClient()
         self.display_list: list[tuple[float, float, str]] = []
         self.scroll = 0
         self.width = WIDTH
@@ -32,18 +34,12 @@ class Browser:
         self.window.bind("<Configure>", self.on_resize)
 
     def load(self, url: str):
-        from browser import request
-
         if url == "about:blank":
             body = ""
         else:
             try:
-                _, headers, body_bytes = request(url)
-                encoding = "utf-8"
-                ct = headers.get("content-type", "")
-                if "charset=" in ct:
-                    encoding = ct.split("charset=", 1)[1].split(";")[0].strip()
-                body = body_bytes.decode(encoding, errors="replace")
+                _, headers, body_bytes = self._client.request(url)
+                body = HttpClient.decode_body(body_bytes, headers)
             except Exception:
                 body = ""
 
@@ -60,7 +56,6 @@ class Browser:
 
         for x, y, char in self.display_list:
             screen_y = y - self.scroll
-            # 화면 밖 문자 건너뛰기 (16ms 프레임 버짓 최적화)
             if screen_y + VSTEP < 0:
                 continue
             if screen_y > self.height:
@@ -75,7 +70,7 @@ class Browser:
 
         page_height = max(y for _, y, _ in self.display_list) + SCROLL_STEP
         if page_height <= self.height:
-            return  # 전체가 화면에 들어오면 스크롤바 숨김
+            return
 
         bar_x0 = self.width - 8
         bar_x1 = self.width
@@ -104,7 +99,6 @@ class Browser:
         self.draw()
 
     def on_mousewheel(self, event):
-        # macOS/Windows: event.delta, Linux: event.num
         if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
             self.scrollup()
         else:

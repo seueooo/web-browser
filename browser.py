@@ -1,53 +1,293 @@
 import socket
 import ssl
-import sys
 import gzip
 import time
-import html as html_module
-from html.parser import HTMLParser
 
 
-DEFAULT_URL = "file:///etc/hosts"
+class URL:
+    """URL 파싱 및 scheme별 분기"""
 
-_socket_pool: dict = {}  # (scheme, host, port) -> (socket, excess_bytes)
-_cache: dict = {}        # url -> (expires_at, status_line, headers, body)
+    def __init__(self, raw: str):
+        self.raw = raw
+        self.scheme, self.host, self.port, self.path = self._parse(raw)
+
+    @staticmethod
+    def _parse(url):
+        if url.startswith("file://"):
+            return "file", "", 0, url[len("file://"):]
+        if url.startswith("data:"):
+            return "data", "", 0, url[len("data:"):]
+        if url.startswith("view-source:"):
+            return "view-source", "", 0, url[len("view-source:"):]
+
+        if "://" not in url:
+            url = "http://" + url
+        scheme, rest = url.split("://", 1)
+
+        if "#" in rest:
+            rest = rest[:rest.index("#")]
+        if "/" in rest:
+            host_port, path = rest.split("/", 1)
+            path = "/" + path
+        else:
+            host_port = rest
+            path = "/"
+
+        if ":" in host_port:
+            host, port_str = host_port.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                raise ValueError(f"Invalid port in URL: {port_str!r}")
+        else:
+            host = host_port
+            port = 443 if scheme == "https" else 80
+        return scheme, host, port, path
+
+    @property
+    def is_network(self) -> bool:
+        return self.scheme in ("http", "https")
+
+    @property
+    def pool_key(self) -> tuple:
+        return (self.scheme, self.host, self.port)
+
+    def resolve_redirect(self, location: str) -> str:
+        if location.startswith("//"):
+            return self.scheme + ":" + location
+        elif location.startswith("/"):
+            port_part = f":{self.port}" if self.port not in (80, 443) else ""
+            return f"{self.scheme}://{self.host}{port_part}{location}"
+        return location
 
 
-def parse_url(url):
-    """Return (scheme, host, port, path) from a URL string."""
-    if url.startswith("file://"):
-        return "file", "", 0, url[len("file://"):]
-    if url.startswith("data:"):
-        return "data", "", 0, url[len("data:"):]
-    if url.startswith("view-source:"):
-        return "view-source", "", 0, url[len("view-source:"):]
+class Connection:
+    """소켓 생성 + keep-alive 풀링"""
 
-    scheme, rest = url.split("://", 1)
-    # Strip fragment
-    if "#" in rest:
-        rest = rest[:rest.index("#")]
-    # Separate host+port from path
-    if "/" in rest:
-        host_port, path = rest.split("/", 1)
-        path = "/" + path
-    else:
-        host_port = rest
-        path = "/"
-    # Extract port from host if present
-    if ":" in host_port:
-        host, port_str = host_port.rsplit(":", 1)
+    def __init__(self):
+        self._pool: dict = {}  # pool_key -> (socket, excess_bytes)
+
+    def get(self, url: URL):
+        """풀에서 꺼내거나 새로 생성. (socket, init_buffer) 반환"""
+        entry = self._pool.pop(url.pool_key, None)
+        if entry is not None:
+            return entry
+
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(10)
+        if url.scheme == "https":
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(raw_sock, server_hostname=url.host)
+        else:
+            s = raw_sock
+        s.connect((url.host, url.port))
+        return s, b""
+
+    def release(self, url: URL, sock, excess: bytes):
+        self._pool[url.pool_key] = (sock, excess)
+
+    def discard(self, sock):
         try:
-            port = int(port_str)
-        except ValueError:
-            raise ValueError(f"Invalid port in URL: {port_str!r}")
-    else:
-        host = host_port
-        port = 443 if scheme == "https" else 80
-    return scheme, host, port, path
+            sock.close()
+        except OSError:
+            pass
+
+    def clear(self):
+        self._pool.clear()
+
+
+class HttpClient:
+    """HTTP 요청, 캐시, 리다이렉트, 바디 디코딩"""
+
+    def __init__(self):
+        self.conn = Connection()
+        self.cache: dict = {}  # url_str -> (expires_at, status_line, headers, body)
+
+    def request(self, raw_url: str, max_redirect=10):
+        """(status_line, headers_dict, body_bytes) 반환"""
+        url = URL(raw_url)
+
+        # -- file:// --
+        if url.scheme == "file":
+            with open(url.path, "rb") as f:
+                body = f.read()
+            return "200 OK", {"content-type": "text/html"}, body
+
+        # -- data: --
+        if url.scheme == "data":
+            meta, _, content = url.path.partition(",")
+            content_type = meta if meta else "text/plain"
+            return "200 OK", {"content-type": content_type}, content.encode("utf-8")
+
+        # -- view-source: --
+        if url.scheme == "view-source":
+            _, inner_headers, inner_body = self.request(url.path, max_redirect)
+            inner_headers["_view_source"] = True
+            return "200 OK", inner_headers, inner_body
+
+        # -- 캐시 조회 --
+        if raw_url in self.cache:
+            expires_at, cached_status, cached_headers, cached_body = self.cache[raw_url]
+            if time.time() < expires_at:
+                return cached_status, cached_headers, cached_body
+            else:
+                del self.cache[raw_url]
+
+        # -- 소켓 연결 --
+        s, init_buffer = self.conn.get(url)
+
+        # -- 요청 전송 --
+        req = self._build_request(url)
+        print(f"\n{'='*60}")
+        print(f">>> HTTP REQUEST >>>")
+        print(f"{'='*60}")
+        print(req.rstrip())
+        print(f"{'='*60}\n")
+        s.sendall(req.encode("utf-8"))
+
+        # -- 응답 헤더 읽기 --
+        status_line, headers, leftover = self._read_headers(s, init_buffer)
+        print(f"{'='*60}")
+        print(f"<<< HTTP RESPONSE <<<")
+        print(f"{'='*60}")
+        print(f"{status_line}")
+        for k, v in headers.items():
+            print(f"{k}: {v}")
+        print(f"{'='*60}\n")
+
+        status_code = status_line.split(" ", 2)[1] if " " in status_line else ""
+        is_redirect = status_code.startswith("3") and "location" in headers
+
+        # -- 바디 읽기 --
+        body = self._read_body(s, url, headers, leftover, is_redirect)
+
+        # -- gzip 해제 --
+        if headers.get("content-encoding", "").lower() == "gzip":
+            body = gzip.decompress(body)
+
+        # -- 캐시 저장 --
+        if status_code == "200":
+            self._cache_response(raw_url, status_line, headers, body)
+
+        # -- 리다이렉트 --
+        if is_redirect:
+            if max_redirect == 0:
+                raise RuntimeError("Too many redirects")
+            location = url.resolve_redirect(headers["location"])
+            return self.request(location, max_redirect - 1)
+
+        return status_line, headers, body
+
+    # -- private helpers --
+
+    @staticmethod
+    def _build_request(url: URL) -> str:
+        headers = {
+            "Host": url.host,
+            "Connection": "keep-alive",
+            "User-Agent": "SimpleBrowser/1.0",
+            "Accept-Encoding": "gzip",
+        }
+        header_lines = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
+        return f"GET {url.path} HTTP/1.1\r\n{header_lines}\r\n\r\n"
+
+    @staticmethod
+    def _read_headers(sock, init_buffer: bytes):
+        """(status_line, headers_dict, leftover_bytes) 반환"""
+        raw = init_buffer
+        while b"\r\n\r\n" not in raw:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+        header_section, _, leftover = raw.partition(b"\r\n\r\n")
+        lines = header_section.decode("utf-8", errors="replace").split("\r\n")
+        status_line = lines[0]
+        headers = {}
+        for line in lines[1:]:
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                headers[k.lower()] = v
+        return status_line, headers, leftover
+
+    def _read_body(self, sock, url, headers, leftover, is_redirect):
+        content_length = int(headers.get("content-length", -1))
+        is_chunked = headers.get("transfer-encoding", "").lower() == "chunked"
+        body = leftover
+
+        if content_length >= 0:
+            while len(body) < content_length:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            excess = body[content_length:]
+            body = body[:content_length]
+            if not is_redirect:
+                self.conn.release(url, sock, excess)
+        elif is_chunked:
+            while b"0\r\n\r\n" not in body:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            term_idx = body.find(b"0\r\n\r\n")
+            if term_idx >= 0:
+                excess = body[term_idx + 5:]
+                body = body[:term_idx + 5]
+            else:
+                excess = b""
+            body = _decode_chunked(body)
+            if not is_redirect:
+                self.conn.release(url, sock, excess)
+        else:
+            sock.settimeout(3)
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                except (TimeoutError, OSError):
+                    break
+                if not chunk:
+                    break
+                body += chunk
+            self.conn.discard(sock)
+
+        return body
+
+    def _cache_response(self, raw_url, status_line, headers, body):
+        cache_control = headers.get("cache-control", "")
+        if "no-store" in cache_control:
+            return
+        max_age = None
+        for part in cache_control.split(","):
+            part = part.strip()
+            if part.startswith("max-age="):
+                try:
+                    max_age = int(part[len("max-age="):])
+                except ValueError:
+                    pass
+        if max_age is not None:
+            self.cache[raw_url] = (time.time() + max_age, status_line, headers, body)
+
+    @staticmethod
+    def decode_body(body: bytes, headers: dict) -> str:
+        """charset 감지 + 디코딩. gui.py에서도 호출."""
+        content_type = headers.get("content-type", "")
+        encoding = "utf-8"
+        if "charset=" in content_type:
+            encoding = content_type.split("charset=", 1)[1].split(";")[0].strip()
+
+        candidates = [encoding] + [e for e in ["utf-8", "euc-kr", "latin-1"] if e != encoding]
+        for enc in candidates:
+            try:
+                return body.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        raise ValueError("Unable to decode body with any supported encoding")
 
 
 def _decode_chunked(data: bytes) -> bytes:
-    """Decode chunked transfer-encoding data."""
+    """chunked transfer-encoding 디코딩"""
     result = b""
     while data:
         newline = data.index(b"\r\n")
@@ -57,242 +297,3 @@ def _decode_chunked(data: bytes) -> bytes:
         result += data[newline + 2: newline + 2 + size]
         data = data[newline + 2 + size + 2:]
     return result
-
-
-def request(url, max_redirect=10):
-    """Fetch URL, return (status_line, headers_dict, body_bytes).
-    Follows 3xx redirects up to max_redirect times.
-    Supports: http, https, file, data, view-source schemes.
-    Reuses keep-alive sockets and caches 200 responses per Cache-Control.
-    """
-    scheme, host, port, path = parse_url(url)
-
-    # file:// scheme
-    if scheme == "file":
-        with open(path, "rb") as f:
-            body = f.read()
-        return "200 OK", {"content-type": "text/html"}, body
-
-    # data: scheme
-    if scheme == "data":
-        meta, _, content = path.partition(",")
-        content_type = meta if meta else "text/plain"
-        return "200 OK", {"content-type": content_type}, content.encode("utf-8")
-
-    # view-source: scheme
-    if scheme == "view-source":
-        inner_status, inner_headers, inner_body = request(path, max_redirect)
-        inner_headers["_view_source"] = True
-        return "200 OK", inner_headers, inner_body
-
-    # Cache lookup
-    if url in _cache:
-        expires_at, cached_status, cached_headers, cached_body = _cache[url]
-        if time.time() < expires_at:
-            return cached_status, cached_headers, cached_body
-        else:
-            del _cache[url]
-
-    # Socket: reuse from pool or create new
-    pool_key = (scheme, host, port)
-    entry = _socket_pool.pop(pool_key, None)
-    if entry is not None:
-        s, init_buffer = entry
-    else:
-        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_sock.settimeout(10)
-        if scheme == "https":
-            ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(raw_sock, server_hostname=host)
-        else:
-            s = raw_sock
-        s.connect((host, port))
-        init_buffer = b""
-
-    headers_to_send = {
-        "Host": host,
-        "Connection": "keep-alive",
-        "User-Agent": "SimpleBrowser/1.0",
-        "Accept-Encoding": "gzip",
-    }
-    header_lines = "\r\n".join(f"{k}: {v}" for k, v in headers_to_send.items())
-    req = f"GET {path} HTTP/1.1\r\n{header_lines}\r\n\r\n"
-    s.sendall(req.encode("utf-8"))
-
-    # Read response headers (start with any excess bytes from previous response)
-    raw_header = init_buffer
-    while b"\r\n\r\n" not in raw_header:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        raw_header += chunk
-    header_section, _, leftover = raw_header.partition(b"\r\n\r\n")
-    header_lines_list = header_section.decode("utf-8", errors="replace").split("\r\n")
-    status_line = header_lines_list[0]
-    headers = {}
-    for line in header_lines_list[1:]:
-        if ": " in line:
-            k, v = line.split(": ", 1)
-            headers[k.lower()] = v
-
-    # Determine redirect early so we know whether to pool the socket
-    status_code = status_line.split(" ", 2)[1] if " " in status_line else ""
-    is_redirect = status_code.startswith("3") and "location" in headers
-
-    # Read body
-    content_length = int(headers.get("content-length", -1))
-    body = leftover
-    if content_length >= 0:
-        while len(body) < content_length:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            body += chunk
-        excess = body[content_length:]  # bytes belonging to the next response
-        body = body[:content_length]
-        if not is_redirect:
-            _socket_pool[pool_key] = (s, excess)  # return socket to pool
-    else:
-        # No Content-Length: read until server closes connection.
-        # HTTP/1.1 keep-alive servers won't send EOF, so treat a timeout
-        # as end-of-body and close the socket.
-        s.settimeout(3)
-        while True:
-            try:
-                chunk = s.recv(4096)
-            except (TimeoutError, OSError):
-                break  # server kept connection alive — treat as EOF
-            if not chunk:
-                break
-            body += chunk
-        s.close()
-
-    # Chunked decoding
-    if headers.get("transfer-encoding", "").lower() == "chunked":
-        body = _decode_chunked(body)
-        _socket_pool.pop(pool_key, None)  # cannot safely reuse after chunked
-
-    # Gzip decompression
-    if headers.get("content-encoding", "").lower() == "gzip":
-        body = gzip.decompress(body)
-
-    # Cache 200 responses per Cache-Control
-    if status_code == "200":
-        cache_control = headers.get("cache-control", "")
-        if "no-store" not in cache_control:
-            max_age = None
-            for part in cache_control.split(","):
-                part = part.strip()
-                if part.startswith("max-age="):
-                    try:
-                        max_age = int(part[len("max-age="):])
-                    except ValueError:
-                        pass
-            if max_age is not None:
-                _cache[url] = (time.time() + max_age, status_line, headers, body)
-
-    # Follow 3xx redirects
-    if is_redirect:
-        if max_redirect == 0:
-            raise RuntimeError("Too many redirects")
-        location = headers["location"]
-        if location.startswith("//"):
-            location = scheme + ":" + location
-        elif location.startswith("/"):
-            port_part = f":{port}" if port not in (80, 443) else ""
-            location = f"{scheme}://{host}{port_part}{location}"
-        return request(location, max_redirect - 1)
-
-    return status_line, headers, body
-
-
-class TextExtractor(HTMLParser):
-    """Collects visible text, skipping <script> and <style> blocks."""
-
-    def __init__(self):
-        super().__init__()
-        self._skip = 0
-        self._parts = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style"):
-            self._skip += 1
-
-    def handle_endtag(self, tag):
-        if tag in ("script", "style"):
-            self._skip = max(0, self._skip - 1)
-
-    def handle_data(self, data):
-        if self._skip == 0:
-            self._parts.append(data)
-
-    def get_text(self):
-        lines = []
-        for part in self._parts:
-            part = html_module.unescape(part)
-            for line in part.splitlines():
-                if line.strip():
-                    lines.append(line)
-        return "\n".join(lines)
-
-
-def show(body_bytes, headers):
-    """Decode body and print plain text, stripping HTML tags."""
-    # view-source: print raw HTML without parsing
-    if headers.get("_view_source"):
-        print(body_bytes.decode("utf-8", errors="replace"))
-        return
-
-    content_type = headers.get("content-type", "")
-
-    # Encoding resolution
-    encoding = "utf-8"
-    if "charset=" in content_type:
-        encoding = content_type.split("charset=", 1)[1].split(";")[0].strip()
-
-    candidates = [encoding] + [e for e in ["utf-8", "euc-kr", "latin-1"] if e != encoding]
-    text = None
-    for enc in candidates:
-        try:
-            text = body_bytes.decode(enc)
-            break
-        except (UnicodeDecodeError, LookupError):
-            continue
-
-    if text is None:
-        raise ValueError("Unable to decode body with any supported encoding")
-
-    if "html" not in content_type:
-        print(text)
-        return
-
-    extractor = TextExtractor()
-    extractor.feed(text)
-    print(extractor.get_text())
-
-
-def main():
-    url = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_URL
-
-    print("=== Request ===")
-    print(f"URL: {url}")
-    print()
-
-    status_line, headers, body = request(url)
-
-    print("=== Response Status ===")
-    print(status_line)
-    print()
-
-    print("=== Response Headers ===")
-    for key, value in headers.items():
-        if not key.startswith("_"):  # skip internal markers like _view_source
-            print(f"{key}: {value}")
-    print()
-
-    print("=== Body (text) ===")
-    show(body, headers)
-
-
-if __name__ == "__main__":
-    main()
