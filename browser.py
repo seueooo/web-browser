@@ -61,6 +61,31 @@ class URL:
         return location
 
 
+# -- 스킴 핸들러 --
+
+class FileSchemeHandler:
+    def handle(self, url, client=None):
+        with open(url.path, "rb") as f:
+            body = f.read()
+        return "200 OK", {"content-type": "text/html"}, body
+
+
+class DataSchemeHandler:
+    def handle(self, url, client=None):
+        meta, _, content = url.path.partition(",")
+        content_type = meta if meta else "text/plain"
+        return "200 OK", {"content-type": content_type}, content.encode("utf-8")
+
+
+class ViewSourceSchemeHandler:
+    def handle(self, url, client):
+        _, inner_headers, inner_body = client.request(url.path)
+        inner_headers["_view_source"] = True
+        return "200 OK", inner_headers, inner_body
+
+
+# -- 소켓 관리 --
+
 class Connection:
     """소켓 생성 + keep-alive 풀링"""
 
@@ -96,8 +121,16 @@ class Connection:
         self._pool.clear()
 
 
+# -- HTTP 클라이언트 --
+
 class HttpClient:
-    """HTTP 요청, 캐시, 리다이렉트, 바디 디코딩"""
+    """HTTP 요청, 캐시, 리다이렉트"""
+
+    SCHEME_HANDLERS = {
+        "file": FileSchemeHandler(),
+        "data": DataSchemeHandler(),
+        "view-source": ViewSourceSchemeHandler(),
+    }
 
     def __init__(self):
         self.conn = Connection()
@@ -107,69 +140,26 @@ class HttpClient:
         """(status_line, headers_dict, body_bytes) 반환"""
         url = URL(raw_url)
 
-        # -- file:// --
-        if url.scheme == "file":
-            with open(url.path, "rb") as f:
-                body = f.read()
-            return "200 OK", {"content-type": "text/html"}, body
+        # -- 스킴 핸들러 디스패치 --
+        handler = self.SCHEME_HANDLERS.get(url.scheme)
+        if handler:
+            return handler.handle(url, client=self)
 
-        # -- data: --
-        if url.scheme == "data":
-            meta, _, content = url.path.partition(",")
-            content_type = meta if meta else "text/plain"
-            return "200 OK", {"content-type": content_type}, content.encode("utf-8")
+        # -- 캐시 히트 --
+        cached = self._get_cached(raw_url)
+        if cached:
+            return cached
 
-        # -- view-source: --
-        if url.scheme == "view-source":
-            _, inner_headers, inner_body = self.request(url.path, max_redirect)
-            inner_headers["_view_source"] = True
-            return "200 OK", inner_headers, inner_body
-
-        # -- 캐시 조회 --
-        if raw_url in self.cache:
-            expires_at, cached_status, cached_headers, cached_body = self.cache[raw_url]
-            if time.time() < expires_at:
-                return cached_status, cached_headers, cached_body
-            else:
-                del self.cache[raw_url]
-
-        # -- 소켓 연결 --
-        s, init_buffer = self.conn.get(url)
-
-        # -- 요청 전송 --
-        req = self._build_request(url)
-        print(f"\n{'='*60}")
-        print(f">>> HTTP REQUEST >>>")
-        print(f"{'='*60}")
-        print(req.rstrip())
-        print(f"{'='*60}\n")
-        s.sendall(req.encode("utf-8"))
-
-        # -- 응답 헤더 읽기 --
-        status_line, headers, leftover = self._read_headers(s, init_buffer)
-        print(f"{'='*60}")
-        print(f"<<< HTTP RESPONSE <<<")
-        print(f"{'='*60}")
-        print(f"{status_line}")
-        for k, v in headers.items():
-            print(f"{k}: {v}")
-        print(f"{'='*60}\n")
-
-        status_code = status_line.split(" ", 2)[1] if " " in status_line else ""
-        is_redirect = status_code.startswith("3") and "location" in headers
-
-        # -- 바디 읽기 --
-        body = self._read_body(s, url, headers, leftover, is_redirect)
-
-        # -- gzip 해제 --
-        if headers.get("content-encoding", "").lower() == "gzip":
-            body = gzip.decompress(body)
+        # -- HTTP 요청/응답 --
+        status_line, headers, body = self._do_http(url)
 
         # -- 캐시 저장 --
+        status_code = status_line.split(" ", 2)[1] if " " in status_line else ""
         if status_code == "200":
             self._cache_response(raw_url, status_line, headers, body)
 
         # -- 리다이렉트 --
+        is_redirect = status_code.startswith("3") and "location" in headers
         if is_redirect:
             if max_redirect == 0:
                 raise RuntimeError("Too many redirects")
@@ -179,6 +169,33 @@ class HttpClient:
         return status_line, headers, body
 
     # -- private helpers --
+
+    def _get_cached(self, raw_url):
+        if raw_url not in self.cache:
+            return None
+        expires_at, cached_status, cached_headers, cached_body = self.cache[raw_url]
+        if time.time() < expires_at:
+            return cached_status, cached_headers, cached_body
+        del self.cache[raw_url]
+        return None
+
+    def _do_http(self, url):
+        s, init_buffer = self.conn.get(url)
+
+        req = self._build_request(url)
+        s.sendall(req.encode("utf-8"))
+
+        status_line, headers, leftover = self._read_headers(s, init_buffer)
+
+        status_code = status_line.split(" ", 2)[1] if " " in status_line else ""
+        is_redirect = status_code.startswith("3") and "location" in headers
+
+        body = self._read_body(s, url, headers, leftover, is_redirect)
+
+        if headers.get("content-encoding", "").lower() == "gzip":
+            body = gzip.decompress(body)
+
+        return status_line, headers, body
 
     @staticmethod
     def _build_request(url: URL) -> str:
@@ -269,21 +286,21 @@ class HttpClient:
         if max_age is not None:
             self.cache[raw_url] = (time.time() + max_age, status_line, headers, body)
 
-    @staticmethod
-    def decode_body(body: bytes, headers: dict) -> str:
-        """charset 감지 + 디코딩. gui.py에서도 호출."""
-        content_type = headers.get("content-type", "")
-        encoding = "utf-8"
-        if "charset=" in content_type:
-            encoding = content_type.split("charset=", 1)[1].split(";")[0].strip()
 
-        candidates = [encoding] + [e for e in ["utf-8", "euc-kr", "latin-1"] if e != encoding]
-        for enc in candidates:
-            try:
-                return body.decode(enc)
-            except (UnicodeDecodeError, LookupError):
-                continue
-        raise ValueError("Unable to decode body with any supported encoding")
+def decode_body(body: bytes, headers: dict) -> str:
+    """charset 감지 + 디코딩"""
+    content_type = headers.get("content-type", "")
+    encoding = "utf-8"
+    if "charset=" in content_type:
+        encoding = content_type.split("charset=", 1)[1].split(";")[0].strip()
+
+    candidates = [encoding] + [e for e in ["utf-8", "euc-kr", "latin-1"] if e != encoding]
+    for enc in candidates:
+        try:
+            return body.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    raise ValueError("Unable to decode body with any supported encoding")
 
 
 def _decode_chunked(data: bytes) -> bytes:

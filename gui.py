@@ -1,5 +1,5 @@
 import tkinter
-from browser import HttpClient
+from browser import HttpClient, decode_body
 from layout import WIDTH, HEIGHT, HSTEP, VSTEP, SCROLL_STEP, lex, layout as do_layout
 
 
@@ -39,7 +39,7 @@ class Browser:
         else:
             try:
                 _, headers, body_bytes = self._client.request(url)
-                body = HttpClient.decode_body(body_bytes, headers)
+                body = decode_body(body_bytes, headers)
             except Exception:
                 body = ""
 

@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from browser import URL, HttpClient
+from browser import URL, HttpClient, decode_body
 
 
 # ---------------------------------------------------------------------------
@@ -465,22 +465,22 @@ def test_request_handles_chunked(client):
 
 
 # ---------------------------------------------------------------------------
-# HttpClient.decode_body()
+# decode_body()
 # ---------------------------------------------------------------------------
 
 def test_decode_body_utf8():
     body = "안녕하세요".encode("utf-8")
-    text = HttpClient.decode_body(body, {"content-type": "text/html; charset=utf-8"})
+    text = decode_body(body, {"content-type": "text/html; charset=utf-8"})
     assert "안녕하세요" in text
 
 
 def test_decode_body_euckr_fallback():
     body = "안녕".encode("euc-kr")
-    text = HttpClient.decode_body(body, {"content-type": "text/html"})
+    text = decode_body(body, {"content-type": "text/html"})
     assert "안녕" in text
 
 
 def test_decode_body_plain():
     body = b"{'key': 'value'}"
-    text = HttpClient.decode_body(body, {"content-type": "application/json"})
+    text = decode_body(body, {"content-type": "application/json"})
     assert "key" in text
